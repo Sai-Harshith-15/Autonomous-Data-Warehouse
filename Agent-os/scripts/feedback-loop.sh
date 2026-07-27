@@ -79,6 +79,30 @@ else
     # TEST_FAILURE patterns
     elif echo "$stderr_block" | grep -qE 'FAILED|AssertionError|assert '; then
         classification="TEST_FAILURE"
+    # TRANSIENT (M7: HTTP errors, timeouts)
+    elif echo "$stderr_block" | grep -qE '429|502|503|timeout|Temporary failure|Connection refused|deadline_exceeded'; then
+        classification="TRANSIENT"
+    # MERGE_CONFLICT
+    elif echo "$stderr_block" | grep -qE 'CONFLICT|merge conflict|Automatic merge failed'; then
+        classification="MERGE_CONFLICT"
+    # CONTRACT_VIOLATION
+    elif echo "$stderr_block" | grep -qE 'wrote outside|denied tool|CONTRACT_VIOLATION'; then
+        classification="CONTRACT_VIOLATION"
+    # BUDGET_EXCEEDED
+    elif echo "$stderr_block" | grep -qE 'budget exceeded|cost ceiling|token limit reached'; then
+        classification="BUDGET_EXCEEDED"
+    # MODEL_UNAVAILABLE
+    elif echo "$stderr_block" | grep -qE 'model.*not found|model.*unavailable|provider.*error|Insufficient balance'; then
+        classification="MODEL_UNAVAILABLE"
+    # SECURITY_FINDING
+    elif echo "$stderr_block" | grep -qE 'gitleaks|secret detected|CVE|vulnerability|SAST'; then
+        classification="SECURITY_FINDING"
+    # INTENT_MISMATCH
+    elif echo "$stderr_block" | grep -qE 'INTENT_MISMATCH|verdict.*FAIL|does not satisfy'; then
+        classification="INTENT_MISMATCH"
+    # SPEC_AMBIGUITY
+    elif echo "$stderr_block" | grep -qE 'ambiguous|untestable|assumption.*unresolved|unclear requirement'; then
+        classification="SPEC_AMBIGUITY"
     # Also check exit code: if exit ≠ 0 and not already classified, treat as TEST_FAILURE
     else
         exit_code_line=$(grep -E '^Exit code:' "$artifact" 2>/dev/null || echo "Exit code: -1")
