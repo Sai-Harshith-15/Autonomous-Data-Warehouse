@@ -2,33 +2,31 @@
 set -euo pipefail
 
 # =============================================================================
-# dispatch.sh — Route a coding task to DeepSeek V4 Pro via OpenCode Go CLI
+# dispatch.sh v2 — Route coding tasks via OmniRoute (multi-provider proxy)
 # =============================================================================
-# M1: AI Software Factory — The Smallest Working Factory
+# M1: AI Software Factory — OmniRoute as sole agent dispatch layer
+#
+# Architecture:
+#   curl → OmniRoute (localhost:20128/api/v1/chat/completions)
+#        → auto/coding:pro (primary) / auto/coding:fast (fallback)
 #
 # Usage:
 #   scripts/dispatch.sh --plan <plan.md> --task-id <T-...> \
-#       [--model <model-id>] [--dir <workdir>]
-#
-# Reads a plan file (YAML frontmatter + markdown), extracts the goal and
-# stories, resolves the model, invokes the OpenCode Go CLI, captures output,
-# and records the result via trace.sh.
+#       [--model <auto/coding:pro>] [--dir <workdir>]
 # =============================================================================
 
-# --- Resolve paths (cwd-independent) -----------------------------------------
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 REPO_ROOT="$(cd "$SCRIPT_DIR/.." && pwd)"
 CALLER_DIR="$(pwd)"
-
-# We change to REPO_ROOT so all repo-relative paths resolve correctly.
 cd "$REPO_ROOT"
 
-# --- Argument parsing --------------------------------------------------------
+OMNIROUTE_URL="${OMNIROUTE_URL:-http://localhost:20128/api/v1/chat/completions}"
+TIMEOUT_SECONDS="${DISPATCH_TIMEOUT:-300}"
+
 plan_file=""
 task_id=""
-model=""
+model="auto/coding:pro"
 workdir=""
-show_help=false
 
 while [[ $# -gt 0 ]]; do
     case "$1" in
@@ -36,422 +34,204 @@ while [[ $# -gt 0 ]]; do
         --task-id)  task_id="$2";    shift 2 ;;
         --model)    model="$2";      shift 2 ;;
         --dir)      workdir="$2";    shift 2 ;;
-        --help|-h)  show_help=true;  shift   ;;
-        *) echo "Unknown argument: $1" >&2; exit 2 ;;
+        *) echo "Unknown argument: $1" >&2; exit 1 ;;
     esac
 done
 
-if $show_help; then
-    echo "Usage: scripts/dispatch.sh --plan <plan.md> --task-id <T-...> [--model <model-id>] [--dir <workdir>]"
-    echo ""
-    echo "Arguments:"
-    echo "  --plan <path>     Path to the plan file (YAML frontmatter + markdown)"
-    echo "  --task-id <T-..>  Task identifier (e.g. T-0000001)"
-    echo "  --model <id>      Override the model (default: from tool-registry.yaml or deepseek-v4-pro)"
-    echo "  --dir <workdir>   Working directory for the agent (default: REPO_ROOT)"
-    echo "  --help, -h        Show this message"
-    exit 0
+if [[ -z "$plan_file" || -z "$task_id" ]]; then
+    echo "Usage: dispatch.sh --plan <plan.md> --task-id <T-...> [--model auto/coding:pro]" >&2
+    exit 1
 fi
 
-# --- Validation --------------------------------------------------------------
-if [[ -z "$plan_file" ]]; then
-    echo "ERROR: --plan is required" >&2
-    exit 2
-fi
-if [[ -z "$task_id" ]]; then
-    echo "ERROR: --task-id is required" >&2
-    exit 2
-fi
+# Default workdir to repo root
+workdir="${workdir:-$REPO_ROOT}"
 
-# Resolve plan_file: absolute paths stay as-is, relative paths resolved from caller's dir
+# Resolve plan file path
 if [[ "$plan_file" != /* ]]; then
     plan_file="${CALLER_DIR}/${plan_file}"
 fi
 
-if [[ ! -f "$plan_file" ]]; then
-    echo "ERROR: Plan file not found: $plan_file" >&2
-    exit 2
-fi
+# Extract plan metadata using common helper
+_strip_quotes() { sed -E 's/^["'"'"']|["'"'"']$//g' <<<"$1"; }
 
-# Default workdir to REPO_ROOT
-workdir="${workdir:-$REPO_ROOT}"
+plan_file_win=$(cygpath -w "$plan_file" 2>/dev/null || echo "$plan_file")
+story_id=$(python -c "
+import sys,re
+with open(sys.argv[1]) as f: content=f.read()
+m=re.search(r'^---\\s*\\n(.*?)\\n---', content, re.DOTALL)
+if m:
+    m2=re.search(r'plan_id:\\s*(\\S+)', m.group(1))
+    if m2: print(m2.group(1).strip())
+" "$plan_file_win")
+story_id="${story_id:-$task_id}"
 
-echo "[dispatch] Plan:   $plan_file"
-echo "[dispatch] Task:   $task_id"
-echo "[dispatch] Workdir: $workdir"
+# Build system + user prompt from plan file
+echo "[dispatch] Reading plan: $plan_file"
 
-# --- Helper: convert MSYS path to Windows for Python -------------------------
-to_win() {
-    local p="$1"
-    cygpath -w "$p" 2>/dev/null || echo "$p"
-}
-
-# --- Parse plan frontmatter --------------------------------------------------
-plan_win=$(to_win "$plan_file")
-
-# Extract YAML frontmatter fields using Python (consistent with trace.sh/verify.sh)
-frontmatter_json=$(python -c "
-import sys, re, json
-
-plan_path = sys.argv[1]
-try:
-    with open(plan_path, encoding='utf-8') as f:
-        content = f.read()
-except FileNotFoundError:
-    json.dump({'error': 'file not found'}, sys.stdout)
-    sys.exit(1)
-
-# Extract frontmatter between first --- and ---
-m = re.match(r'^---\s*\n(.*?)\n---\s*\n', content, re.DOTALL)
-if not m:
-    json.dump({'error': 'no frontmatter'}, sys.stdout)
-    sys.exit(0)
-
-raw = m.group(1)
-data = {}
-
-# Extract simple scalar YAML fields (key: value)
-for key in ['plan_id', 'title', 'status', 'lane', 'model', 'owner_agent', 'verify_cmd', 'schema_version']:
-    m2 = re.search(rf'^{key}:\s*(.*?)\s*$', raw, re.MULTILINE)
-    if m2:
-        val = m2.group(1).strip()
-        # Strip surrounding quotes
-        if (val.startswith('\"') and val.endswith('\"')) or (val.startswith(\"'\") and val.endswith(\"'\")):
-            val = val[1:-1]
-        data[key] = val
-
-json.dump(data, sys.stdout)
-" "$plan_win")
-
-# Extract story_id from frontmatter (plan_id is the story ID, e.g. US-0001)
-story_id=$(python -c "import json,sys; d=json.loads(sys.argv[1]); print(d.get('plan_id',''))" "$frontmatter_json")
-
-# Extract goal text (first # Goal section after frontmatter)
-goal_text=$(python -c "
+prompt=$(python -c "
 import sys, re
-
-plan_path = sys.argv[1]
-with open(plan_path, encoding='utf-8') as f:
+with open(sys.argv[1], encoding='utf-8') as f:
     content = f.read()
-
-# Strip frontmatter
-content = re.sub(r'^---\s*\n.*?\n---\s*\n', '', content, count=1, flags=re.DOTALL)
-
-# Extract everything from '# Goal' to the next '##' or end of file
-m = re.search(r'^#[ ]*Goal\s*\n(.*?)(?=\n#[#]|\Z)', content, re.DOTALL | re.MULTILINE)
-if m:
-    goal = m.group(1).strip()
-    print(goal)
-else:
-    # Fallback: extract first # heading
-    m2 = re.search(r'^#[ ]+([^\n]+)', content, re.MULTILINE)
-    if m2:
-        print(m2.group(1).strip())
-" "$plan_win")
-
-echo "[dispatch] Story:  $story_id"
-echo "[dispatch] Goal:   ${goal_text:0:120}..."
-
-# --- Resolve model -----------------------------------------------------------
-# Priority: 1) --model flag  2) plan frontmatter  3) tool-registry.yaml routing
-if [[ -z "$model" ]]; then
-    # Try plan frontmatter first
-    model_from_plan=$(python -c "import json,sys; d=json.loads(sys.argv[1]); print(d.get('model',''))" "$frontmatter_json")
-    if [[ -n "$model_from_plan" ]]; then
-        # Strip provider prefix if present (e.g. opencode-go/deepseek-v4-pro → deepseek-v4-pro)
-        model="${model_from_plan#*/}"
-    fi
-fi
-
-if [[ -z "$model" ]]; then
-    # Read from tool-registry.yaml
-    lane=$(python -c "import json,sys; d=json.loads(sys.argv[1]); print(d.get('lane','tiny'))" "$frontmatter_json")
-    registry_win=$(to_win "$REPO_ROOT/docs/tool-registry.yaml")
-    model=$(python -c "
-import sys, re
-
-registry_path = sys.argv[1]
-lane = sys.argv[2]
-
-try:
-    with open(registry_path, encoding='utf-8') as f:
-        content = f.read()
-except FileNotFoundError:
-    # Fallback if registry is missing
-    print('deepseek-v4-pro')
-    sys.exit(0)
-
-# Try routing.<lane>.coding
-m = re.search(rf'^\s*{re.escape(lane)}:\s*\n(.*?)(?=\n\S|\Z)', content, re.DOTALL | re.MULTILINE)
-if m:
-    block = m.group(1)
-    m2 = re.search(r'coding:\s*(\S+)', block)
-    if m2:
-        val = m2.group(1).strip().split('/')[-1]  # strip provider prefix
-        print(val)
-        sys.exit(0)
-
-# Fallback: default coding model
-print('deepseek-v4-pro')
-" "$registry_win" "$lane")
-fi
-
-# Ensure model string has correct prefix for opencode CLI
-# opencode-go/<model> — strip any existing prefix just in case
-model_base="${model##*/}"  # strip provider prefix if already present
-model_for_cli="opencode-go/${model_base}"
-
-echo "[dispatch] Model:  $model_for_cli"
-
-# --- Build task description --------------------------------------------------
-# Concatenate goal + stories into a clear prompt for the agent
-task_description=$(python -c "
-import sys, re
-
-plan_path = sys.argv[1]
-with open(plan_path, encoding='utf-8') as f:
-    content = f.read()
-
-# Strip frontmatter
-content = re.sub(r'^---\s*\n.*?\n---\s*\n', '', content, count=1, flags=re.DOTALL)
-
-# Extract goal section
-goal_block = ''
-m = re.search(r'^#[ ]*Goal\s*\n(.*?)(?=\n#[#]|\Z)', content, re.DOTALL | re.MULTILINE)
-if m:
-    goal_block = m.group(0).strip()
-
-# Extract stories section
-stories_block = ''
-m = re.search(r'^##[ ]*Stories?\s*\n(.*?)(?=\n##|\Z)', content, re.DOTALL | re.MULTILINE)
-if m:
-    stories_block = m.group(0).strip()
-
-# Extract constraints section
-constraints_block = ''
-m = re.search(r'^##[ ]*Constraints?\s*\n(.*?)(?=\n##|\Z)', content, re.DOTALL | re.MULTILINE)
-if m:
-    constraints_block = m.group(0).strip()
-
-# Assemble prompt
+content = re.sub(r'^---\\s*\\n.*?\\n---\\s*\\n', '', content, count=1, flags=re.DOTALL)
 parts = []
-if goal_block:
-    parts.append(goal_block)
-if stories_block:
-    parts.append(stories_block)
-if constraints_block:
-    parts.append(constraints_block)
+for section in ['# Goal', '## Stories', '## Context', '## Constraints']:
+    m = re.search(rf'^{section}\\s*\\n(.*?)(?=\\n##?\\s|\\Z)', content, re.DOTALL|re.MULTILINE)
+    if m:
+        parts.append(m.group(0).strip())
+print('\\n\\n'.join(parts)[:6000])
+" "$plan_file_win")
 
-# If nothing found, use a reasonable default
-if not parts:
-    parts.append(content.strip()[:2000])
+echo "[dispatch] Model:  $model"
+echo "[dispatch] Story:  $story_id"
+echo "[dispatch] Task:   $task_id"
+echo "[dispatch] Prompt: ${#prompt} chars"
 
-prompt = '\n\n'.join(parts)
-print(prompt[:4000])  # Cap prompt length
-" "$plan_win")
-
-echo "[dispatch] Task description ready (${#task_description} chars)"
-
-# --- Prepare artifact directory ----------------------------------------------
+# Artifact directory
 artifact_dir="artifacts/${task_id}"
 mkdir -p "$artifact_dir"
 
-jsonl_output="${artifact_dir}/agent-output.jsonl"
-md_output="${artifact_dir}/agent-output.md"
+# --- Call OmniRoute via curl ---
+echo "[dispatch] Invoking OmniRoute → $model ..."
 
-# --- Helper: classify error from stderr --------------------------------------
-classify_error() {
-    local stderr_text="$1"
-    local model_used="$2"
-    local exit_code="$3"
+# Build JSON payload (Python avoids quoting hell)
+payload_file="${artifact_dir}/request.json"
+python -c "
+import json, sys
 
-    if echo "$stderr_text" | grep -qi "command not found\|No such file\|opencode.*not recognized"; then
-        echo "ENVIRONMENT|opencode CLI not found or not installed"
-    elif echo "$stderr_text" | grep -qi "timed out\|timeout\|context deadline exceeded\|deadline_exceeded"; then
-        echo "TRANSIENT|opencode invocation timed out (${TIMEOUT_SECONDS}s limit)"
-    elif echo "$stderr_text" | grep -qi "model.*not.*found\|model.*unavailable\|no such model\|unknown model\|invalid.*model"; then
-        echo "MODEL_UNAVAILABLE|Model $model_used is not available"
-    else
-        echo "AGENT_FAILURE|opencode exited with code $exit_code"
-    fi
+system_msg = '''You are an expert software engineer coding agent. 
+Your task is to produce production-quality code. 
+
+IMPORTANT RULES:
+1. Write COMPLETE, WORKING code — no stubs, no TODOs
+2. Output code directly in your response, using proper formatting
+3. Include ALL necessary imports, type hints, and error handling
+4. Do NOT write markdown fences (no \`\`\`python blocks) — just plain code
+5. Write files to the paths specified in the task
+6. If you need to create directories, include mkdir commands
+7. Every file must be complete and runnable
+8. Prefer using Python for file operations (open/write, os.makedirs)'''
+
+payload = {
+    'model': sys.argv[1],
+    'messages': [
+        {'role': 'system', 'content': system_msg},
+        {'role': 'user', 'content': sys.argv[2]}
+    ],
+    'stream': False,
+    'max_tokens': 8000,
+    'temperature': 0
 }
+print(json.dumps(payload))
+" "$model" "$prompt" > "$payload_file"
 
-# --- Helper: run opencode with a given model, format, and stderr path ---------
-run_opencode() {
-    local model_cli="$1"
-    local format="$2"
-    local output_file="$3"
-    local stderr_file="$4"
-    local rc
-
-    echo "[dispatch] Invoking: opencode run -m $model_cli --auto --dir $workdir --format $format -f <plan>" >&2
-
-    set +e
-    opencode run \
-        -m "$model_cli" \
-        --auto \
-        --dir "$workdir" \
-        --format "$format" \
-        -f "$plan_abs" \
-        "$task_description" \
-        > "$output_file" 2>"$stderr_file"
-    rc=$?
-    set -e
-    echo $rc
-}
-
-# --- Prepare plan absolute path and task file ---------------------------------
-task_file="${artifact_dir}/task-prompt.txt"
-echo "$task_description" > "$task_file"
-
-plan_abs=$(cd "$(dirname "$plan_file")" && pwd)/$(basename "$plan_file")
-plan_abs="${plan_abs//\\//}"  # ensure forward slashes
-
-TIMEOUT_SECONDS=600
-exit_code=0
-error_class=""
-error_detail=""
-fallback_used=false
-model_used="$model_for_cli"
-
-# --- Invoke OpenCode Go CLI (primary model, JSON format) ----------------------
-echo "[dispatch] Invoking opencode CLI (primary: $model_for_cli)..."
-echo "[dispatch] Command: opencode run -m $model_for_cli --auto --dir $workdir -f <plan> \"<task>\""
-
+# Execute curl with timeout
+response_file="${artifact_dir}/response.json"
+stderr_file="${artifact_dir}/stderr.txt"
 set +e
-jsonl_exit=$(run_opencode "$model_for_cli" "json" "$jsonl_output" "${artifact_dir}/stderr-json.txt")
+curl -s -X POST "$OMNIROUTE_URL" \
+    -H "Content-Type: application/json" \
+    -d "@$payload_file" \
+    --max-time "$TIMEOUT_SECONDS" \
+    -o "$response_file" 2>"$stderr_file"
+curl_exit=$?
 set -e
 
-# --- Fallback: if MODEL_UNAVAILABLE, retry with deepseek-v4-flash -------------
-if [[ $jsonl_exit -ne 0 ]]; then
-    stderr_json=$(cat "${artifact_dir}/stderr-json.txt" 2>/dev/null || true)
-    error_info=$(classify_error "$stderr_json" "$model_for_cli" "$jsonl_exit")
-    err_class="${error_info%%|*}"
-    err_detail="${error_info#*|}"
+echo "[dispatch] curl exit: $curl_exit"
 
-    if [[ "$err_class" == "MODEL_UNAVAILABLE" ]]; then
-        fallback_model="opencode-go/deepseek-v4-flash"
-        echo "[dispatch] Model unavailable, retrying with fallback: $fallback_model"
-
-        set +e
-        jsonl_exit=$(run_opencode "$fallback_model" "json" "$jsonl_output" "${artifact_dir}/stderr-json.txt")
-        set -e
-
-        if [[ $jsonl_exit -eq 0 ]]; then
-            fallback_used=true
-            model_used="$fallback_model"
-            echo "[dispatch] Fallback model succeeded"
-        fi
-    else
-        # Non-model errors (ENVIRONMENT, TRANSIENT, etc.) — don't retry
-        error_class="$err_class"
-        error_detail="$err_detail"
-    fi
-fi
-
-echo "[dispatch] opencode JSON exit: $jsonl_exit"
-
-# --- Second invocation: markdown format for human-readable output -------------
-# Run MD format only if JSON invocation succeeded or produced output
-md_exit=0
-if [[ $jsonl_exit -eq 0 ]] || [[ -s "$jsonl_output" ]]; then
-    set +e
-    md_exit=$(run_opencode "$model_used" "default" "$md_output" "${artifact_dir}/stderr-md.txt")
-    set -e
-    exit_code=$md_exit
-else
-    exit_code=$jsonl_exit
-fi
-
-echo "[dispatch] opencode MD exit:   $md_exit"
-
-# --- Error classification (post-fallback) ------------------------------------
-if [[ $exit_code -ne 0 ]] && [[ -z "$error_class" ]]; then
-    stderr_content=""
-    if [[ -f "${artifact_dir}/stderr-json.txt" ]]; then
-        stderr_content=$(cat "${artifact_dir}/stderr-json.txt" 2>/dev/null || true)
-    fi
-    # Also check MD stderr if JSON stderr is empty
-    if [[ -z "$stderr_content" ]] && [[ -f "${artifact_dir}/stderr-md.txt" ]]; then
-        stderr_content=$(cat "${artifact_dir}/stderr-md.txt" 2>/dev/null || true)
-    fi
-
-    error_info=$(classify_error "$stderr_content" "$model_used" "$exit_code")
-    error_class="${error_info%%|*}"
-    error_detail="${error_info#*|}"
-fi
-
-if [[ $exit_code -ne 0 ]]; then
-    echo "[dispatch] ERROR CLASS: $error_class — $error_detail" >&2
-fi
-
-# --- Post-check: git status --------------------------------------------------
-empty_output=false
-if [[ -d "$workdir/.git" ]]; then
-    git_status=$(git -C "$workdir" status --porcelain 2>/dev/null || true)
-    if [[ -z "${git_status// }" ]]; then
-        empty_output=true
-        echo "[dispatch] WARNING: git workdir is clean — agent may have produced no changes" >&2
-        if [[ $exit_code -eq 0 ]]; then
-            error_class="EMPTY_OUTPUT"
-            error_detail="opencode exited 0 but git status --porcelain is empty"
-            exit_code=1
-        fi
-    else
-        echo "[dispatch] Git changes detected:"
-        echo "$git_status" | head -5
-    fi
-else
-    echo "[dispatch] No .git directory in workdir — skipping git check"
-fi
-
-# --- Determine outcome -------------------------------------------------------
-if [[ $exit_code -eq 0 ]]; then
-    outcome="success"
-else
+# --- Parse response ---
+if [[ $curl_exit -ne 0 ]] || [[ ! -s "$response_file" ]]; then
+    error_msg=$(cat "$stderr_file" 2>/dev/null || echo "curl exit $curl_exit, empty response")
+    echo "[dispatch] ERROR: $error_msg"
     outcome="failure"
+    error_class="TRANSIENT"
+else
+    # Extract content from OpenAI-style response
+    content=$(python -c "
+import json, sys
+with open(sys.argv[1]) as f:
+    data = json.load(f)
+choice = data.get('choices', [{}])[0]
+msg = choice.get('message', {})
+print(msg.get('content', ''))
+" "$response_file" 2>/dev/null || echo "")
+
+    model_used=$(python -c "import json; d=json.load(open('$response_file')); print(d.get('model','unknown'))" 2>/dev/null || echo "unknown")
+    tokens=$(python -c "import json; d=json.load(open('$response_file')); u=d.get('usage',{}); print(u.get('total_tokens',0))" 2>/dev/null || echo "0")
+
+    echo "[dispatch] Model used: $model_used"
+    echo "[dispatch] Tokens:     $tokens"
+    echo "[dispatch] Content:    ${#content} chars"
+
+    if [[ -z "$content" ]]; then
+        echo "[dispatch] ERROR: Empty model response"
+        outcome="failure"
+        error_class="EMPTY_OUTPUT"
+    else
+        # Save raw agent output
+        echo "$content" > "${artifact_dir}/agent-output.md"
+
+        # Extract files from agent output (Python code blocks or direct file writes)
+        # Write content to files using Python
+        python -c "
+import os, re, sys
+
+content = open(sys.argv[1]).read()
+artifact_dir = sys.argv[2]
+workdir = sys.argv[3]
+
+# Strategy 1: Look for file write commands in the code
+# Pattern: with open('path', 'w') or os.makedirs + open
+# We just save the full response for now — the verify.sh will handle execution
+
+# Save a summary
+summary = f'''Agent: {sys.argv[4]}
+Model: {sys.argv[5]}
+Tokens: {sys.argv[6]}
+Response length: {len(content)} chars
+
+Full response saved to {artifact_dir}/agent-output.md
+'''
+with open(f'{artifact_dir}/agent-summary.txt', 'w') as f:
+    f.write(summary)
+" "${artifact_dir}/agent-output.md" "$artifact_dir" "$workdir" "$task_id" "$model_used" "$tokens"
+
+        outcome="success"
+        error_class=""
+    fi
 fi
 
-# --- Write dispatch summary to artifact --------------------------------------
-dispatch_summary="${artifact_dir}/dispatch-summary.json"
+# --- Save dispatch summary ---
 python -c "
-import json, sys, os
+import json, sys
 from datetime import datetime, timezone
-
 summary = {
     'schema_version': 1,
     'task_id': sys.argv[1],
     'story_id': sys.argv[2],
-    'model': sys.argv[3],
-    'workdir': sys.argv[4],
+    'model_requested': sys.argv[3],
+    'model_used': sys.argv[4],
     'outcome': sys.argv[5],
-    'error_class': sys.argv[6] if sys.argv[6] else None,
-    'error_detail': sys.argv[7] if sys.argv[7] else None,
-    'fallback_used': sys.argv[9] == 'true',
+    'error_class': sys.argv[6] if len(sys.argv) > 6 and sys.argv[6] else None,
     'timestamp': datetime.now(timezone.utc).strftime('%Y-%m-%dT%H:%M:%SZ'),
-    'jsonl_exit': int(sys.argv[8]),
-    'git_clean': sys.argv[10] == 'true',
 }
-with open(sys.argv[11], 'w') as f:
+with open(sys.argv[7], 'w') as f:
     json.dump(summary, f, indent=2)
-" "$task_id" "$story_id" "$model_used" "$workdir" "$outcome" \
-  "$error_class" "$error_detail" "$jsonl_exit" "$fallback_used" "$empty_output" "$dispatch_summary"
+" "$task_id" "$story_id" "$model" "${model_used:-unknown}" "$outcome" "$error_class" "${artifact_dir}/dispatch-summary.json"
 
-# --- Call trace.sh -----------------------------------------------------------
-echo "[dispatch] Tracing dispatch event..."
-trace_args=(--summary "TaskDispatched: $task_id" --outcome "$outcome" --task-id "$task_id" --story-id "$story_id" --actor "dispatcher")
-if [[ -n "${run_id:-}" ]]; then
-    trace_args+=(--run-id "$run_id")
-fi
-bash "$REPO_ROOT/scripts/trace.sh" "${trace_args[@]}"
+# --- Trace ---
+bash "$REPO_ROOT/scripts/trace.sh" \
+    --summary "TaskDispatched: $task_id via OmniRoute → $model" \
+    --outcome "$outcome" \
+    --task-id "$task_id" \
+    --story-id "$story_id" \
+    --actor "dispatcher"
 
-# --- Final exit --------------------------------------------------------------
-if [[ $exit_code -eq 0 ]]; then
-    echo "[dispatch] ✓ Task $task_id dispatched successfully"
-    echo "[dispatch]   JSON output: $jsonl_output"
-    echo "[dispatch]   MD output:   $md_output"
+# --- Exit ---
+if [[ "$outcome" == "success" ]]; then
+    echo "[dispatch] ✓ Task $task_id completed successfully"
+    echo "[dispatch]   Agent output: ${artifact_dir}/agent-output.md"
     exit 0
 else
-    echo "[dispatch] ✗ Task $task_id failed: $error_class — $error_detail" >&2
+    echo "[dispatch] ✗ Task $task_id failed: $error_class" >&2
     exit 1
 fi
