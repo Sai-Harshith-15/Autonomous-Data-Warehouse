@@ -282,9 +282,7 @@ with open(plan, 'w') as f:
         set +e
         bash scripts/dispatch.sh \
             --plan "$plan_file" \
-            --story-id "$story_id" \
-            --task-id "$task_id" \
-            --failure-context "$artifact"
+            --task-id "$task_id"
         dispatch_exit=$?
         set -e
     else

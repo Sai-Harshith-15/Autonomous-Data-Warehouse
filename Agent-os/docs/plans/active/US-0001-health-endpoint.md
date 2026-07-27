@@ -14,6 +14,7 @@ owner_agent: sdlc-backend-engineer
 model: opencode-go/deepseek-v4-pro
 depends_on: []
 created: 2026-07-26
+retry_count: 1
 ---
 
 # Goal
