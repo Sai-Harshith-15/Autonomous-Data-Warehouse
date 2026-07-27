@@ -4,7 +4,7 @@ plan_id: US-0001
 title: "Add /health endpoint to FastAPI app"
 status: active
 lane: tiny
-verify_cmd: "cd projects/fastapi-health && python -m pytest tests/ -x --tb=short -q"
+verify_cmd: "cd projects/fastapi-health && .venv/Scripts/python.exe -m pytest tests/ -x --tb=short -q"
 verify_url: "curl -sS -m 3 http://localhost:8000/health | python -c \"import sys,json; d=json.load(sys.stdin); assert d['status']=='ok'\""
 acceptance:
   - "pytest exits 0 with all tests passing"
