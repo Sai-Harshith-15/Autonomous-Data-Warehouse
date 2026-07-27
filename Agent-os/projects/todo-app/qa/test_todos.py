@@ -1,17 +1,10 @@
-Looking at the task, I need to write pytest tests for a FastAPI todo API. Let me first check if the main.py exists to understand the API structure.
-
-```python
 import pytest
 import httpx
 from httpx import ASGITransport
 
-# Import the FastAPI app from main.py in the same project directory
-import sys
-import os
-
-# Ensure the project root is on the path
-sys.path.insert(0, os.path.join(os.path.dirname(__file__), ".."))
-
+# Import the FastAPI app from backend/main.py
+import sys, os
+sys.path.insert(0, os.path.join(os.path.dirname(__file__), "..", "backend"))
 from main import app
 
 @pytest.fixture

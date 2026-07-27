@@ -55,6 +55,16 @@ def list_todos():
     """
     return todos_db
 
+@app.get("/todos/{id}", response_model=TodoItem)
+def get_todo(id: int):
+    """
+    Gets a single todo item.
+    """
+    for todo in todos_db:
+        if todo["id"] == id:
+            return todo
+    raise HTTPException(status_code=404, detail="Todo not found")
+
 @app.patch("/todos/{id}", response_model=TodoItem)
 def update_todo_status(id: int, update_data: TodoUpdate):
     """
