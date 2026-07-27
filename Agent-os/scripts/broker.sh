@@ -20,7 +20,10 @@ while [[ $# -gt 0 ]]; do
 done
 [[ -z "$contract_file" ]] && { echo "Usage: broker.sh --contract <contract.json> --task-id <T-...>" >&2; exit 1; }
 
-contract_win=$(cygpath -w "$contract_file" 2>/dev/null || echo "$contract_file")
+# Resolve to absolute path from REPO_ROOT
+[[ "$contract_file" != /* ]] && contract_file="${REPO_ROOT}/${contract_file}"
+# Convert to Windows path for Python open()
+contract_win=$(cygpath -m "$contract_file" 2>/dev/null || echo "$contract_file")
 
 echo "[broker] Reading contract: $contract_file"
 

@@ -35,10 +35,13 @@ from collections import defaultdict
 
 project = sys.argv[1]
 
-# Collect files per agent group
+# Find files per agent group (exclude .venv, cache, build dirs)
 agent_files = defaultdict(list)
+excluded = {'.venv', '.pytest_cache', '__pycache__', '.git', 'node_modules', 'dist', 'build', 'merged'}
 if os.path.exists(project):
     for root, dirs, files in os.walk(project):
+        # Skip excluded dirs
+        dirs[:] = [d for d in dirs if d not in excluded]
         for f in files:
             rel = os.path.relpath(os.path.join(root, f), project)
             # Determine agent from path prefix
