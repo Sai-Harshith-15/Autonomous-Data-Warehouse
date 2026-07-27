@@ -1,0 +1,44 @@
+{
+  "sdlc-backend-engineer": {
+    "score": 8,
+    "total": 8,
+    "status": "PASS",
+    "details": [
+      "\u2713 projects/*/backend/*.py: 1 files",
+      "\u2713 projects/*/tests/*.py: 2 files",
+      "\u2713 must_not_write_to_frontend: enforced by contract",
+      "\u2713 must_not_access_secrets: enforced by contract",
+      "\u2713 must_not_push_to_main: enforced by contract",
+      "\u2713 rubric_code_syntax: structural check passed",
+      "\u2713 rubric_test_coverage: structural check passed",
+      "\u2713 rubric_follows_contract_outputs: structural check passed"
+    ]
+  },
+  "sdlc-qa-engineer": {
+    "score": 6,
+    "total": 6,
+    "status": "PASS",
+    "details": [
+      "\u2713 projects/*/qa/*.py: 2 files",
+      "\u2713 must_not_fix_production_code: enforced by contract",
+      "\u2713 must_not_skip_tests: enforced by contract",
+      "\u2713 rubric_test_quality: structural check passed",
+      "\u2713 rubric_failure_classification: structural check passed",
+      "\u2713 rubric_evidence_complete: structural check passed"
+    ]
+  },
+  "sdlc-requirements-analyst": {
+    "score": 7,
+    "total": 7,
+    "status": "PASS",
+    "details": [
+      "\u2713 docs/stories/*.md: 1 files",
+      "\u2713 docs/stories/*.md: 1 files",
+      "\u2713 must_not_invent_tech_stack: enforced by contract",
+      "\u2713 must_not_write_code: enforced by contract",
+      "\u2713 rubric_spec_clarity: structural check passed",
+      "\u2713 rubric_edge_cases_covered: structural check passed",
+      "\u2713 rubric_ambiguities_flagged: structural check passed"
+    ]
+  }
+}
