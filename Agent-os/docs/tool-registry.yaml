@@ -1,0 +1,33 @@
+# Machine-readable tool registry consumed by dispatch.sh (M1)
+# Format: YAML
+
+providers:
+  opencode-go:
+    type: opencode
+    models:
+      deepseek-v4-pro:
+        role: primary-coding
+        command: "opencode run -m opencode-go/deepseek-v4-pro --auto --dir {dir}"
+      deepseek-v4-flash:
+        role: fast-coding
+        command: "opencode run -m opencode-go/deepseek-v4-flash --auto --dir {dir}"
+      glm-5.2:
+        role: planning
+        command: "opencode run -m opencode-go/glm-5.2 --auto"
+      kimi-k3:
+        role: planning
+        command: "opencode run -m opencode-go/kimi-k3 --auto"
+
+routing:
+  tiny:
+    planning: opencode-go/glm-5.2
+    coding: opencode-go/deepseek-v4-pro
+    coding_fallback: opencode-go/deepseek-v4-flash
+  normal:
+    planning: opencode-go/glm-5.2
+    coding: opencode-go/deepseek-v4-pro
+  high-risk:
+    planning: opencode-go/glm-5.2
+    coding: opencode-go/deepseek-v4-pro
+
+repo_root: "D:/GitRepo/Autonomous-Data-Warehouse/Agent-os"

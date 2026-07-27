@@ -1,0 +1,20 @@
+[project]
+name = "fastapi-health"
+version = "0.1.0"
+description = "Minimal FastAPI app with /health endpoint for AI Software Factory M1"
+requires-python = ">=3.11"
+dependencies = [
+    "fastapi>=0.115.0",
+    "uvicorn[standard]>=0.30.0",
+]
+
+[dependency-groups]
+dev = [
+    "pytest>=8.0",
+    "httpx>=0.27.0",
+    "coverage>=7.0",
+]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+addopts = "-x --tb=short -q"
