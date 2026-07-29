@@ -1,96 +1,100 @@
 #!/usr/bin/env bash
 set -euo pipefail
 
-# Resolve to repo root (Agent-os/) regardless of where script is called from
+# trace.sh v2 — append a JSONL event to both runs/<run-id>/events.jsonl AND SQLite harness.db
+# Usage: trace.sh --run-id <R-...> --event-type <type> [--task-id <T-...>] --summary "..."
+#   [--outcome <outcome>] [--agent <agent>] [--tool <tool>]
+#   [--file-changed <path>] [--gate <name>] [--elapsed-ms <ms>] [--metadata <json>]
+
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 REPO_ROOT="$(cd "$SCRIPT_DIR/.." && pwd)"
-cd "$REPO_ROOT"
 
-# trace.sh — append a JSONL event to events/YYYY-MM-DD.jsonl
-# Usage: trace.sh --summary "..." --outcome success|failure --task-id T-... --story-id US-... --actor orchestrator
-
+run_id=""
+task_id=""
+event_type=""
 summary=""
 outcome=""
-task_id=""
-story_id=""
-actor=""
-run_id=""
+agent=""
+tool=""
+file_changed=""
+gate=""
+elapsed_ms=""
+metadata="{}"
 
 while [[ $# -gt 0 ]]; do
     case "$1" in
-        --summary)  summary="$2";  shift 2 ;;
-        --outcome)  outcome="$2";  shift 2 ;;
-        --task-id)  task_id="$2";  shift 2 ;;
-        --story-id) story_id="$2"; shift 2 ;;
-        --actor)    actor="$2";    shift 2 ;;
-        --run-id)   run_id="$2";   shift 2 ;;
-        *) echo "Unknown argument: $1" >&2; exit 1 ;;
+        --run-id)       run_id="$2";      shift 2 ;;
+        --task-id)      task_id="$2";     shift 2 ;;
+        --event-type)   event_type="$2";  shift 2 ;;
+        --summary)      summary="$2";     shift 2 ;;
+        --outcome)      outcome="$2";     shift 2 ;;
+        --agent)        agent="$2";       shift 2 ;;
+        --tool)         tool="$2";        shift 2 ;;
+        --file-changed) file_changed="$2"; shift 2 ;;
+        --gate)         gate="$2";        shift 2 ;;
+        --elapsed-ms)   elapsed_ms="$2";  shift 2 ;;
+        --metadata)     metadata="$2";    shift 2 ;;
+        *) echo "Unknown: $1" >&2; exit 1 ;;
     esac
 done
 
-# Defaults
-actor="${actor:-orchestrator}"
-outcome="${outcome:-unknown}"
+[[ -z "$run_id" || -z "$event_type" ]] && { echo "Usage: trace.sh --run-id <R-...> --event-type <type> --summary <...>" >&2; exit 1; }
 
 ts=$(date -u +"%Y-%m-%dT%H:%M:%SZ")
 today=$(date -u +"%Y-%m-%d")
 
-events_dir="events"
-events_file="${events_dir}/${today}.jsonl"
-
-mkdir -p "$events_dir"
-
-# Auto-generate run_id if not provided
-if [[ -z "$run_id" ]]; then
-    nnn=1
-    if [[ -f "$events_file" ]]; then
-        # Find highest NNN in today's run_ids using Python (jq not available)
-        last_nnn=$(python -c "
-import re, sys
-max_n = 0
-try:
-    with open('$events_file') as f:
-        for line in f:
-            m = re.search(r'R-\\d{4}-\\d{2}-\\d{2}-(\\d{3})', line)
-            if m:
-                n = int(m.group(1))
-                if n > max_n:
-                    max_n = n
-except FileNotFoundError:
-    pass
-print(max_n)
-")
-        if [[ "$last_nnn" =~ ^[0-9]+$ ]] && [[ "$last_nnn" -gt 0 ]]; then
-            nnn=$((last_nnn + 1))
-        fi
-    fi
-    run_id=$(printf "R-%s-%03d" "$today" "$nnn")
-fi
-
-# Build and validate JSON using Python (pass args via sys.argv to avoid quoting issues)
-payload=$(python -c "
+# Build JSON payload using Python with sys.argv (avoids bash quoting issues)
+payload=$(python -c '
 import json, sys
 obj = {
-    'schema_version': 1,
-    'ts': sys.argv[1],
-    'run_id': sys.argv[2],
-    'task_id': sys.argv[3] if sys.argv[3] else None,
-    'story_id': sys.argv[4] if sys.argv[4] else None,
-    'actor': sys.argv[5],
-    'event': 'Trace',
-    'summary': sys.argv[6],
-    'outcome': sys.argv[7],
-    'tokens': None,
-    'cost_usd': None,
-    'duration_ms': None
+    "schema_version": 2,
+    "time": sys.argv[1],
+    "run_id": sys.argv[2],
+    "task_id": sys.argv[3] if sys.argv[3] != "-" else None,
+    "event_type": sys.argv[4],
+    "agent": sys.argv[5] if sys.argv[5] != "-" else None,
+    "tool": sys.argv[6] if sys.argv[6] != "-" else None,
+    "file_changed": sys.argv[7] if sys.argv[7] != "-" else None,
+    "gate": sys.argv[8] if sys.argv[8] != "-" else None,
+    "elapsed_ms": int(sys.argv[9]) if sys.argv[9] != "-" else None,
+    "outcome": sys.argv[10] if sys.argv[10] != "-" else None,
+    "summary": sys.argv[11],
+    "metadata": json.loads(sys.argv[12]) if sys.argv[12] != "-" else {}
 }
-# Remove None values
 obj = {k: v for k, v in obj.items() if v is not None}
-print(json.dumps(obj, separators=(',', ':')))
-" "$ts" "$run_id" "$task_id" "$story_id" "$actor" "$summary" "$outcome")
+print(json.dumps(obj, separators=(",", ":")))
+' "$ts" "$run_id" "${task_id:--}" "$event_type" "${agent:--}" "${tool:--}" "${file_changed:--}" "${gate:--}" "${elapsed_ms:--}" "${outcome:--}" "$summary" "${metadata:--}")
 
-# Validate JSON
-python -c "import json, sys; json.loads(sys.argv[1])" "$payload" || { echo "Invalid JSON" >&2; exit 1; }
+# 1. Write to run-specific JSONL
+runs_dir="/d/agent-os/runs/${run_id}"
+mkdir -p "$runs_dir"
+echo "$payload" >> "${runs_dir}/events.jsonl"
 
-echo "$payload" >> "$events_file"
+# 2. Write to daily events file for backward compat
+mkdir -p "$REPO_ROOT/events"
+echo "$payload" >> "$REPO_ROOT/events/${today}.jsonl"
+
+# 3. Write to SQLite if possible
+python -c '
+import json, sys, os
+try:
+    DB = os.environ.get("HARNESS_DB", "D:/agent-os/harness.db")
+    import sqlite3
+    conn = sqlite3.connect(DB, timeout=10)
+    conn.execute("PRAGMA journal_mode=WAL")
+    obj = json.loads(sys.argv[1])
+    conn.execute("""INSERT INTO events (schema_version, time, run_id, task_id, event_type,
+                    agent, tool, file_changed, gate, elapsed_ms, outcome, summary, metadata)
+                    VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
+                (obj.get("schema_version", 2), obj.get("time"), obj.get("run_id"),
+                 obj.get("task_id"), obj.get("event_type"), obj.get("agent"),
+                 obj.get("tool"), obj.get("file_changed"), obj.get("gate"),
+                 obj.get("elapsed_ms"), obj.get("outcome"), obj.get("summary"),
+                 json.dumps(obj.get("metadata", {}))))
+    conn.commit()
+    conn.close()
+except Exception as e:
+    pass
+' "$payload" 2>/dev/null || true
+
 exit 0
