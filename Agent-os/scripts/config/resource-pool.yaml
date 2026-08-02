@@ -1,0 +1,31 @@
+# AI Software Factory — Resource Pool Configuration
+# Each pool limits concurrent task execution in its category.
+# Slots are tracked atomically via SQLite triggers.
+
+pools:
+  global:
+    max_slots: 3
+    description: "Global concurrency limit — max tasks running at once"
+  per_project:
+    max_slots: 1
+    description: "Per-project tasks — prevents project-level stampede"
+  expensive:
+    max_slots: 1
+    description: "Expensive operations (security scan, full build, deployment)"
+  test:
+    max_slots: 1
+    description: "Test execution — isolates CI/test runners"
+
+retry:
+  max_retries: 2
+  backoff_base_seconds: 30
+  max_backoff_seconds: 600
+  retryable_failures:
+    - TRANSIENT
+    - TEST_FAILURE
+    - ENVIRONMENT
+  non_retryable_failures:
+    - CONTRACT_VIOLATION
+    - SECURITY_FINDING
+    - SPEC_AMBIGUITY
+    - BUDGET_EXCEEDED

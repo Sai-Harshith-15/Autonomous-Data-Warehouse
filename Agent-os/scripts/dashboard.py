@@ -22,12 +22,13 @@ except ImportError:
     exit(1)
 
 # ─── Config ──────────────────────────────────────────────────────────────
-DB_PATH = os.environ.get("HARNESS_DB", "D:/agent-os/harness.db")
-RUNS_DIR = Path(os.environ.get("RUNS_DIR", "D:/agent-os/runs"))
-EVENTS_DIR = Path(os.environ.get("EVENTS_DIR", "D:/agent-os/runs"))
+REPO_ROOT = Path(__file__).resolve().parent.parent
+FACTORY_HOME = Path(os.environ.get("FACTORY_HOME", REPO_ROOT / ".factory"))
+DB_PATH = os.environ.get("HARNESS_DB", str(FACTORY_HOME / "state" / "harness.db"))
+RUNS_DIR = Path(os.environ.get("RUNS_DIR", FACTORY_HOME / "runs"))
 
 app = FastAPI(title="AI Software Factory Dashboard", version="2.0.0")
-app.add_middleware(CORSMiddleware, allow_origins=["*"], allow_methods=["*"], allow_headers=["*"])
+app.add_middleware(CORSMiddleware, allow_origins=["http://127.0.0.1:8199", "http://localhost:8199"], allow_credentials=False, allow_methods=["GET"], allow_headers=["Content-Type"])
 
 # ─── In-memory event ring buffer (last 1000 events) ─────────────
 event_buffer = deque(maxlen=1000)

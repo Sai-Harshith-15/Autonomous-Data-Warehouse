@@ -10,16 +10,42 @@ Usage:
   python _dag_scheduler.py --retry <run-id> --task-id <T-...>
 """
 
-import json, sys, os, time, hashlib, subprocess, threading
-from datetime import datetime, timezone
+import json, sys, os, time, hashlib, subprocess, threading, shlex
+from datetime import datetime, timezone, timedelta
 from pathlib import Path
+
+# Module-level import for TaskResult (used in dispatch_task exception handler)
+try:
+    from runtime.worker_base import TaskResult
+except ImportError:
+    TaskResult = None  # type: ignore
+
+# ─── Worker Runtime ────────────────────────────────────────────────────────
+# Lazy-import workers so the scheduler works without runtime/ deps
+# when running verification-only tasks.
+_RUNTIME_LOADED = False
+_WORKERS = []
+
+def _load_workers():
+    global _RUNTIME_LOADED, _WORKERS
+    if _RUNTIME_LOADED:
+        return
+    try:
+        from runtime.worker_verification import VerificationWorker
+        from runtime.worker_omniroute import OmniRouteCodingWorker
+        _WORKERS = [OmniRouteCodingWorker(), VerificationWorker()]
+    except ImportError:
+        # Fall back — inline TaskResult as a simple dict
+        _WORKERS = []
+    _RUNTIME_LOADED = True
 
 # ─── Config ──────────────────────────────────────────────────────────────
 REPO_ROOT = Path(__file__).resolve().parent.parent
-DB_PATH = os.environ.get("HARNESS_DB", "D:/agent-os/harness.db")
-POOL_CONFIG = os.environ.get("POOL_CONFIG", "D:/hermes-factory/config/resource-pool.yaml")
-EVENTS_DIR = REPO_ROOT / "events"
-RUNS_DIR = Path("D:/agent-os/runs")
+FACTORY_HOME = Path(os.environ.get("FACTORY_HOME", REPO_ROOT / ".factory"))
+DB_PATH = os.environ.get("HARNESS_DB", str(FACTORY_HOME / "state" / "harness.db"))
+POOL_CONFIG = os.environ.get("POOL_CONFIG", str(REPO_ROOT / "scripts" / "config" / "resource-pool.yaml"))
+RUNS_DIR = Path(os.environ.get("RUNS_DIR", FACTORY_HOME / "runs"))
+EVENTS_DIR = RUNS_DIR  # events live inside runs dir
 LOCK_TIMEOUT = 30  # seconds
 
 # ─── States ───────────────────────────────────────────────────────────────
@@ -81,9 +107,19 @@ def update_task_status(run_id, task_id, status, **kw):
         sets = ["status=?"]
         vals = [status]
         now = datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%fZ")
-        if status == STATE_CLAIMED or status == STATE_RETRYING:
+        if status == STATE_CLAIMED:
             sets.append("started_at=?")
             vals.append(now)
+        elif status == STATE_RETRYING:
+            sets.append("started_at=?")
+            vals.append(now)
+            retry_count = kw.get("retry_count", 1)
+            # Exponential backoff: 2^retry_count * 30 seconds
+            backoff_seconds = (2 ** min(retry_count, 5)) * 30
+            from datetime import timedelta
+            retry_after = (datetime.now(timezone.utc) + timedelta(seconds=backoff_seconds)).strftime("%Y-%m-%dT%H:%M:%fZ")
+            sets.append("retry_after=?")
+            vals.append(retry_after)
         elif status in (STATE_SUCCEEDED, STATE_FAILED, STATE_CANCELLED):
             sets.append("finished_at=?")
             vals.append(now)
@@ -120,7 +156,7 @@ def insert_event(run_id, event_type, task_id=None, agent=None, tool=None,
                      file_changed, gate, outcome, summary, json.dumps(kw.get("metadata", {}))))
         conn.commit()
     # Also write to JSONL for dashboard streaming
-    runs_dir = Path(RUNS_DIR) / str(run_id)
+    runs_dir = RUNS_DIR / str(run_id)
     runs_dir.mkdir(parents=True, exist_ok=True)
     ev = {"schema_version": 2, "time": now, "run_id": run_id, "task_id": task_id,
           "event_type": event_type, "agent": agent, "tool": tool,
@@ -154,16 +190,31 @@ def cache_store(run_id, task_id, gate_name, git_sha, outcome, exit_code, command
         conn.commit()
 
 def acquire_slot(pool_name, task_id):
-    """Acquire a resource pool slot. Returns True if acquired."""
+    """Acquire a resource pool slot atomically with BEGIN IMMEDIATE."""
     with db_conn() as conn:
-        pool = conn.execute("SELECT * FROM resource_pool WHERE pool_name=?", (pool_name,)).fetchone()
+        conn.execute("BEGIN IMMEDIATE")
+        pool = conn.execute(
+            "SELECT pool_name, max_slots FROM resource_pool WHERE pool_name=?",
+            (pool_name,)
+        ).fetchone()
         if not pool:
-            return True  # pool doesn't exist → unlimited
-        if pool["used_slots"] >= pool["max_slots"]:
+            conn.execute("COMMIT")
+            return True
+        
+        current = conn.execute(
+            "SELECT COUNT(*) as cnt FROM pool_slots WHERE pool_name=?",
+            (pool_name,)
+        ).fetchone()
+        
+        if current["cnt"] >= pool["max_slots"]:
+            conn.execute("COMMIT")
             return False
-        conn.execute("INSERT OR IGNORE INTO pool_slots (pool_name, task_id) VALUES (?, ?)",
-                    (pool_name, task_id))
-        conn.commit()
+        
+        conn.execute(
+            "INSERT INTO pool_slots (pool_name, task_id) VALUES (?, ?)",
+            (pool_name, task_id)
+        )
+        conn.execute("COMMIT")
         return True
 
 def release_slot(pool_name, task_id):
@@ -190,29 +241,40 @@ def compute_readiness(tasks):
     ready = []
     for t in tasks:
         sid = t["task_id"]
-        if t["status"] != STATE_PENDING:
-            continue
-        deps = dep_map.get(sid, [])
-        if not deps:
-            ready.append(sid)
-            continue
-        # Check all deps succeeded
-        dep_states = {}
-        for d in dep_map[sid]:
-            for t2 in tasks:
-                if t2["task_id"] == d:
-                    dep_states[d] = t2["status"]
+        if t["status"] == STATE_PENDING:
+            deps = dep_map.get(sid, [])
+            if not deps:
+                ready.append(sid)
+                continue
+            # Check all deps succeeded
+            dep_states = {}
+            for d in dep_map[sid]:
+                for t2 in tasks:
+                    if t2["task_id"] == d:
+                        dep_states[d] = t2["status"]
+                        break
+            blocked = False
+            for d, st in dep_states.items():
+                if st in (STATE_FAILED, STATE_CANCELLED):
+                    blocked = True
+                    # Mark this task as blocked
+                    update_task_status(t["run_id"], sid, STATE_BLOCKED,
+                                       summary=f"Depends on {d} which is {st}")
                     break
-        blocked = False
-        for d, st in dep_states.items():
-            if st in (STATE_FAILED, STATE_CANCELLED):
-                blocked = True
-                # Mark this task as blocked
-                update_task_status(t["run_id"], sid, STATE_BLOCKED,
-                                   summary=f"Depends on {d} which is {st}")
-                break
-        if not blocked and all(st == STATE_SUCCEEDED for st in dep_states.values()):
-            ready.append(sid)
+            if not blocked and all(st == STATE_SUCCEEDED for st in dep_states.values()):
+                ready.append(sid)
+        elif t["status"] == STATE_RETRYING:
+            # Check if retry_after has elapsed
+            retry_after = t.get("retry_after")
+            if retry_after:
+                try:
+                    from datetime import datetime, timezone
+                    ra = datetime.fromisoformat(retry_after)
+                    if ra <= datetime.now(timezone.utc):
+                        update_task_status(t["run_id"], sid, STATE_PENDING, summary="Retry backoff elapsed")
+                        # Don't add to ready yet — needs one more pass
+                except (ValueError, TypeError):
+                    pass
     return ready
 
 def count_tasks(tasks, status):
@@ -232,10 +294,20 @@ def get_status_counts(tasks):
         counts[st] = counts.get(st, 0) + 1
     return counts
 
+def _exec_cmd(cmd, **kwargs):
+    """Execute command safely — no shell=True."""
+    if isinstance(cmd, str):
+        cmd_parts = shlex.split(cmd)
+    else:
+        cmd_parts = list(cmd)
+    return subprocess.run(cmd_parts, shell=False, **kwargs)
+
+
 # ─── Dispatch ─────────────────────────────────────────────────────────────
 
 def dispatch_task(task_id, run_id):
-    """Execute a task: runs verify_cmd, captures evidence."""
+    """Execute a task via the appropriate worker (coding agent or verification)."""
+    _load_workers()
     task = get_task(run_id, task_id)
     if not task:
         return
@@ -244,104 +316,74 @@ def dispatch_task(task_id, run_id):
     update_task_status(run_id, task_id, STATE_RUNNING)
     insert_event(run_id, "task_started", task_id=task_id, summary=f"Started: {task['goal']}")
 
-    # Run verification commands
-    verification_cmds = json.loads(task.get("verification", "[]") or "[]")
-    if not verification_cmds:
-        # No verification → mark succeeded
-        update_task_status(run_id, task_id, STATE_SUCCEEDED, elapsed_ms=0)
-        insert_event(run_id, "task_completed", task_id=task_id, outcome="success",
-                     summary=f"Completed: {task['goal']}")
-        release_all_slots(task_id)
-        return
-
     # Create task log directory
     task_dir = Path(RUNS_DIR) / str(run_id) / "tasks" / task_id
     task_dir.mkdir(parents=True, exist_ok=True)
-    stdout_path = str(task_dir / "stdout.log")
-    stderr_path = str(task_dir / "stderr.log")
 
-    start_ts = time.time()
-    all_passed = True
-    failure_class = None
-    cmd_output = ""
+    # Route to first matching worker
+    result = None
+    for worker in _WORKERS:
+        if worker.can_handle(task):
+            insert_event(run_id, "task_dispatched", task_id=task_id,
+                         agent=worker.worker_label,
+                         summary=f"Worker: {worker.worker_label}")
+            start_ts = time.time()
+            try:
+                result = worker.execute(task, run_id, task_dir)
+            except Exception as e:
+                elapsed = int((time.time() - start_ts) * 1000)
+                result = TaskResult(
+                    success=False,
+                    summary=f"Worker exception: {e}",
+                    evidence={"exit_code": -3, "stdout": "", "stderr": str(e)},
+                    failure_class="ENVIRONMENT",
+                )
+            break
 
-    for cmd in verification_cmds:
-        ev = {"run_id": run_id, "task_id": task_id, "gate": cmd[:60]}
-        insert_event(run_id, "gate_started", task_id=task_id, gate=cmd[:60],
-                     summary=f"Running: {cmd[:80]}")
+    # Handle result
+    total_elapsed = int((time.time() - start_ts) * 1000) if result else 0
 
-        # Apply evidence cache if git_sha available
-        run = get_run(run_id)
-        if run and run.get("git_sha"):
-            cached = cache_lookup(run["git_sha"], hashlib.sha256(cmd.encode()).hexdigest()[:16])
-            if cached:
-                insert_event(run_id, "gate_passed", task_id=task_id, gate=cmd[:60],
-                             outcome="pass (cached)", summary=f"Cached: {cmd[:80]}")
-                with open(stdout_path, "a") as f:
-                    f.write(f"[CACHE HIT] {cmd}\n")
-                continue
-
-        with open(stdout_path, "a") as f:
-            f.write(f"[RUNNING] {cmd}\n")
-        try:
-            result = subprocess.run(cmd, shell=True, capture_output=True, text=True, timeout=task.get("timeout_seconds", 900))
-            with open(stdout_path, "a") as f:
-                f.write(result.stdout)
-            with open(stderr_path, "a") as f:
-                f.write(result.stderr if result.stderr else "")
-
-            elapsed = int((time.time() - start_ts) * 1000)
-            if result.returncode == 0:
-                insert_event(run_id, "gate_passed", task_id=task_id, gate=cmd[:60],
-                             outcome="pass", elapsed_ms=elapsed)
-                # Cache the result
-                if run and run.get("git_sha"):
-                    cache_store(run_id, task_id, hashlib.sha256(cmd.encode()).hexdigest()[:16],
-                                run["git_sha"], "pass", result.returncode, cmd, stdout_path, elapsed)
-            else:
-                all_passed = False
-                failure_class = "TEST_FAILURE"
-                insert_event(run_id, "gate_failed", task_id=task_id, gate=cmd[:60],
-                             outcome="fail", elapsed_ms=elapsed, summary=f"Exit: {result.returncode}")
-        except subprocess.TimeoutExpired:
-            all_passed = False
-            failure_class = "TRANSIENT"
-            with open(stdout_path, "a") as f:
-                f.write(f"[TIMEOUT] exceeded {task.get('timeout_seconds', 900)}s\n")
-            insert_event(run_id, "gate_failed", task_id=task_id, gate=cmd[:60],
-                         outcome="timeout", summary="Command timed out")
-        except Exception as e:
-            all_passed = False
-            failure_class = "ENVIRONMENT"
-            with open(stdout_path, "a") as f:
-                f.write(f"[ERROR] {e}\n")
-
-    total_elapsed = int((time.time() - start_ts) * 1000)
-
-    if all_passed:
-        update_task_status(run_id, task_id, STATE_SUCCEEDED, elapsed_ms=total_elapsed)
+    if result and result.success:
+        update_task_status(run_id, task_id, STATE_SUCCEEDED, elapsed_ms=total_elapsed,
+                           result_summary=result.summary,
+                           metadata={"evidence": result.evidence})
         insert_event(run_id, "task_completed", task_id=task_id, outcome="success",
-                     elapsed_ms=total_elapsed, summary=f"Completed: {task['goal']}")
+                     elapsed_ms=total_elapsed, summary=result.summary)
     else:
+        failure_class = result.failure_class if result else "NO_WORKER"
         retry_count = task.get("retry_count", 0) + 1
         max_retries = task.get("max_retries", 2)
-        if retry_count <= max_retries and failure_class in ("TEST_FAILURE", "TRANSIENT", "ENVIRONMENT"):
+        if retry_count <= max_retries and failure_class in ("TEST_FAILURE", "TRANSIENT", "ENVIRONMENT", "OMNIROUTE_ERROR", "EMPTY_RESPONSE", "API_ERROR"):
             update_task_status(run_id, task_id, STATE_RETRYING, retry_count=retry_count,
                                failure_class=failure_class, elapsed_ms=total_elapsed)
             insert_event(run_id, "task_failed", task_id=task_id, outcome="retrying",
-                         elapsed_ms=total_elapsed, summary=f"Retry {retry_count}/{max_retries}: {failure_class}")
+                         elapsed_ms=total_elapsed,
+                         summary=f"Retry {retry_count}/{max_retries}: {failure_class}")
         else:
             update_task_status(run_id, task_id, STATE_FAILED, retry_count=retry_count,
                                failure_class=failure_class, elapsed_ms=total_elapsed)
             insert_event(run_id, "task_failed", task_id=task_id, outcome="failed",
-                         elapsed_ms=total_elapsed, summary=f"Failed after {retry_count} retries")
+                         elapsed_ms=total_elapsed,
+                         summary=f"Failed: {failure_class} — {result.summary if result else 'No worker available'}")
 
     release_all_slots(task_id)
+
+
+def ensure_schema():
+    """Ensure schema is up to date. Run at startup."""
+    with db_conn() as conn:
+        # Add retry_after column if missing
+        try:
+            conn.execute("ALTER TABLE tasks ADD COLUMN retry_after TEXT")
+        except sqlite3.OperationalError:
+            pass  # already exists
+
 
 # ─── Main Scheduler Loop ──────────────────────────────────────────────────
 
 def scheduler_loop(run_id, dry_run=False):
     """Main loop: find ready tasks, claim resources, dispatch, repeat."""
+    ensure_schema()
     run = get_run(run_id)
     if not run:
         print(f"[scheduler] Run {run_id} not found", file=sys.stderr)
@@ -456,7 +498,20 @@ def scheduler_loop(run_id, dry_run=False):
     failed = counts.get(STATE_FAILED, 0)
     blocked = counts.get(STATE_BLOCKED, 0)
 
-    run_status = STATE_SUCCEEDED if failed == 0 else STATE_FAILED
+    cancelled = counts.get(STATE_CANCELLED, 0)
+    awaiting = counts.get(STATE_AWAITING_APPROVAL, 0)
+
+    if cancelled > 0:
+        run_status = STATE_CANCELLED
+    elif failed > 0:
+        run_status = STATE_FAILED
+    elif blocked > 0:
+        run_status = STATE_BLOCKED
+    elif awaiting > 0:
+        run_status = STATE_AWAITING_APPROVAL
+    else:
+        run_status = STATE_SUCCEEDED
+
     update_run_status(run_id, run_status, elapsed_ms=elapsed)
     insert_event(run_id, "run_completed", outcome=run_status, elapsed_ms=elapsed,
                  summary=f"Total: {total}, Succeeded: {succeeded}, Failed: {failed}, Blocked: {blocked}")

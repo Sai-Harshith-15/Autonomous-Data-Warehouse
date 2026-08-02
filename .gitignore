@@ -25,10 +25,15 @@ checkpoints/
 # === Approvals — pending human gates (§13.5) ===
 approvals/pending/
 
+# === Factory runtime state (from _dag_scheduler.py defaults) ===
+.factory/
+
 # === OS noise ===
 Thumbs.db
 .DS_Store
 desktop.ini
+*.bak
+*.orig
 
 # === Hermes desktop attachments ===
 .hermes/desktop-attachments/
